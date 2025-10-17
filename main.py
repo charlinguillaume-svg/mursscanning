@@ -1,31 +1,44 @@
-import time, re, os, yaml, pandas as pd, requests
+import time, re, os, sys, yaml, pandas as pd, requests
 from urllib.parse import quote
 from bs4 import BeautifulSoup
 
+def log(*a): print(*a, file=sys.stdout, flush=True)
+
 def fetch(url: str, ua: str, timeout: int=25) -> str | None:
     try:
-        r = requests.get(url, headers={"User-Agent": ua}, timeout=timeout, allow_redirects=True)
-        if r.status_code != 200: return None
+        r = requests.get(
+            url,
+            headers={"User-Agent": ua, "Accept": "text/html,application/xhtml+xml"},
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        log("GET", r.status_code, url[:200])
+        if r.status_code != 200:
+            return None
         return r.text
-    except Exception:
+    except Exception as e:
+        log("ERR fetch:", e)
         return None
 
-def discover_links(html: str, base_domain: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if href.startswith("/"):
-            href = f"https://{base_domain}{href}"
-        if base_domain in href:
-            if re.search(r"(annonce|fiche|ref|id=|\d{5,})", href, re.IGNORECASE):
+def discover_links(html: str, base_domain: str):
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("/"):
+                href = f"https://{base_domain}{href}"
+            if base_domain in href and re.search(r"(annonce|fiche|ref|id=|\d{5,})", href, re.IGNORECASE):
                 links.append(href.split("#")[0])
-    # dedupe
-    seen, out = set(), []
-    for u in links:
-        if u not in seen:
-            seen.add(u); out.append(u)
-    return out
+        # dedupe
+        seen, out = set(), []
+        for u in links:
+            if u not in seen:
+                seen.add(u); out.append(u)
+        return out
+    except Exception as e:
+        log("ERR discover_links:", e)
+        return []
 
 def money(text: str):
     if not text: return None
@@ -37,31 +50,46 @@ def money(text: str):
     except: return None
 
 def parse_generic(html: str) -> dict:
-    text = re.sub(r"\s+"," ", BeautifulSoup(html, "html.parser").get_text(" ", strip=True))
-    def find_eur(label, span=80):
-        m = re.search(rf"{label}\s*[:\-]?\s*.{{0,{span}}}€", text, re.IGNORECASE)
-        return money(m.group(0)) if m else None
-    prix    = find_eur(r"Prix(?: de vente)?|Prix net vendeur|Price") or money(text)
-    loyer   = find_eur(r"Loyer annuel(?: HT)?|Revenu locatif|Loyers? nets?", 90)
-    charges = find_eur(r"Charges(?: locatives)?", 60)
-    taxe    = find_eur(r"Taxe fonci[eè]re|TF", 60)
-    m_rend  = re.search(r"Rendement\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*%", text, re.IGNORECASE)
-    rendement = float(m_rend.group(1).replace(",",".")) if m_rend else None
-    bail    = (re.search(r"(Bail|Type de bail|Échéance bail)\s*[:\-]?\s*([A-Za-z0-9\/\-\.,\s]{3,80})", text, re.IGNORECASE) or [None])[0]
-    loc     = (re.search(r"(Locataire|Enseigne|Occupant)\s*[:\-]?\s*([A-Za-z0-9\-\.,\s]{2,80})", text, re.IGNORECASE) or [None])[0]
-    act     = (re.search(r"(Restauration|Pharmacie|Boulangerie|Banque|Santé|Supermarché|Retail)", text, re.IGNORECASE) or [None])
-    activite = act[1] if act and len(act.groups())>0 else None
-    return {
-        "prix": prix, "loyer": loyer, "charges": charges, "taxe": taxe,
-        "rendement_annonce": rendement, "bail": bail, "locataire": loc,
-        "activite": activite, "raw": text
-    }
+    try:
+        text = re.sub(r"\s+"," ", BeautifulSoup(html, "html.parser").get_text(" ", strip=True))
+        def find_eur(label, span=80):
+            m = re.search(rf"{label}\s*[:\-]?\s*.{{0,{span}}}€", text, re.IGNORECASE)
+            return money(m.group(0)) if m else None
+        prix    = find_eur(r"Prix(?: de vente)?|Prix net vendeur|Price") or money(text)
+        loyer   = find_eur(r"Loyer annuel(?: HT)?|Revenu locatif|Loyers? nets?", 90)
+        charges = find_eur(r"Charges(?: locatives)?", 60)
+        taxe    = find_eur(r"Taxe fonci(?:e|è)re|TF", 60)
+
+        m_rend  = re.search(r"Rendement\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*%", text, re.IGNORECASE)
+        rendement = float(m_rend.group(1).replace(",",".")) if m_rend else None
+
+        m_bail = re.search(r"(Bail|Type de bail|Échéance bail)\s*[:\-]?\s*([A-Za-z0-9\/\-\.,\s]{3,80})", text, re.IGNORECASE)
+        bail = m_bail.group(0) if m_bail else None
+
+        m_loc = re.search(r"(Locataire|Enseigne|Occupant)\s*[:\-]?\s*([A-Za-z0-9\-\.,\s]{2,80})", text, re.IGNORECASE)
+        locataire = m_loc.group(0) if m_loc else None
+
+        m_act = re.search(r"(Restauration|Pharmacie|Boulangerie|Banque|Sant[ée]|Supermarch[ée]|Retail)", text, re.IGNORECASE)
+        activite = m_act.group(1) if m_act else None
+
+        return {
+            "prix": prix, "loyer": loyer, "charges": charges, "taxe": taxe,
+            "rendement_annonce": rendement, "bail": bail, "locataire": locataire,
+            "activite": activite, "raw": text
+        }
+    except Exception as e:
+        log("ERR parse_generic:", e)
+        return {"prix":None,"loyer":None,"charges":None,"taxe":None,"rendement_annonce":None,
+                "bail":None,"locataire":None,"activite":None,"raw":""}
 
 def detect_city(raw: str, cities: list[str], fallback: str) -> str:
-    for c in cities:
-        if re.search(rf"\b{re.escape(c)}\b", raw, re.IGNORECASE):
-            return c
-    return fallback or ""
+    try:
+        for c in cities:
+            if re.search(rf"\b{re.escape(c)}\b", raw, re.IGNORECASE):
+                return c
+        return fallback or ""
+    except Exception:
+        return fallback or ""
 
 def score_emplacement(city: str, raw: str, axes_map: dict) -> str:
     axes = axes_map.get(city, [])
@@ -140,17 +168,21 @@ def run():
                 for q in queries or [""]:
                     url = pattern.format(city=quote(city), query=quote(q))
                     html = fetch(url, ua, timeout); time.sleep(throttle)
-                    if not html: continue
-                    for link in discover_links(html, domain):
+                    if not html: 
+                        continue
+                    links = discover_links(html, domain)
+                    log(f"[{name}] {city or '-'} {q or '-'} → {len(links)} liens")
+                    for link in links:
                         det = fetch(link, ua, timeout); time.sleep(throttle)
-                        if not det: continue
+                        if not det: 
+                            continue
                         f = parse_generic(det)
                         prix, loyer, charges, taxe = f["prix"], f["loyer"], f["charges"], f["taxe"]
-                        if prix is not None and (prix < pmin or prix > pmax): 
+                        if prix is not None and (prix < pmin or prix > pmax):
                             continue
                         brut = round((loyer/prix)*100,2) if prix and loyer and prix>0 else None
                         net  = round(((loyer-(charges or 0)-(taxe or 0))/prix)*100,2) if prix and loyer and prix>0 else None
-                        if ((brut or 0) < min_y) and ((net or 0) < min_y): 
+                        if ((brut or 0) < min_y) and ((net or 0) < min_y):
                             continue
                         detected = detect_city(f["raw"] or "", cities, city)
                         empl = score_emplacement(detected, f["raw"] or "", AXES_PRIME) if detected else ""
@@ -164,11 +196,22 @@ def run():
                             "Activité": f["activite"], "Emplacement (score)": empl
                         })
 
-    df = pd.DataFrame(rows).drop_duplicates(subset=["URL"])
-    if not os.path.isdir("output"): os.makedirs("output", exist_ok=True)
+    df = pd.DataFrame(rows).drop_duplicates(subset=["URL"]) if rows else pd.DataFrame(columns=[
+        "Source","Domaine","URL","Ville (détectée)","Prix de vente (€)","Loyer annuel HT-HC (€)",
+        "Charges locatives (€)","Taxe foncière (€)","Rendement brut (%)","Rendement net (%)",
+        "Bail","Locataire","Activité","Emplacement (score)"
+    ])
+
+    os.makedirs("output", exist_ok=True)
     out = "output/filter_ge_{:.0f}_1to3M.csv".format(min_y)
     df.to_csv(out, index=False, encoding="utf-8")
-    print("Saved", out, "Rows:", len(df))
+    log("Saved", out, "Rows:", len(df))
 
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except Exception as e:
+        # On logge l'erreur et on termine sans stacktrace bruyante
+        print("FATAL:", e, file=sys.stderr)
+        # On force un code 0 pour laisser l'artifact s'uploader malgré tout :
+        # sys.exit(1)  # <-- si tu veux que l'échec soit visible, dé-commente cette ligne.
