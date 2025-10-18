@@ -39,7 +39,8 @@ def discover_links(html: str, base_domain: str):
     except Exception as e:
         log("ERR discover_links:", e)
         return []
-
+# Sécurité : ne traite pas plus de 50 pages détaillées par source
+MAX_PAGES_PER_SOURCE = 50
 def money(text: str):
     if not text: return None
     t = text.replace("\xa0"," ")
